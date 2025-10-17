@@ -7,8 +7,10 @@ from .utils import clean_text, check_file_size_bytes, safe_filename
 from .config import GOOGLE_API_KEY, MAX_FILE_SIZE_MB
 import google.generativeai as genai_old
 import json
+import hashlib
 from google import genai  # SDK mới
 
+EVAL_CACHE = {}
 
 if GOOGLE_API_KEY:
     genai_old.configure(api_key=GOOGLE_API_KEY)
@@ -83,17 +85,51 @@ def call_gemini_summarize(text: str, model_name: str = "gemini-2.5-flash") -> st
 def call_gemini_generate_mcqs(text: str, num_questions: int = 5, model_name: str = "gemini-2.5-flash") -> list:
     model = genai_old.GenerativeModel(model_name, tools=[])
     # Yêu cầu model phát hiện ngôn ngữ đầu vào và sinh câu hỏi trắc nghiệm bằng cùng ngôn ngữ
-    prompt = (
-        f"Hãy phát hiện ngôn ngữ của nội dung dưới đây. Sau đó sinh ra {num_questions} "
-        "câu hỏi trắc nghiệm dựa trên nội dung, bằng cùng ngôn ngữ của nội dung. "
-        "Trả về CHÍNH XÁC một mảng JSON (chỉ JSON) với các trường sau: "
-        "\n- context: tóm tắt ngắn bối cảnh của câu hỏi "
-        "\n- question: câu hỏi "
-        "\n- options: mảng 4 phần tử, mỗi phần tử là lựa chọn bắt đầu bằng 'A.', 'B.', 'C.' hoặc 'D.' "
-        "\n- answer: chứa  đáp án đúng bắt đầu bằng('A.', 'B.', 'C.' hoặc 'D.') "
-        "\nKHÔNG bao gồm lời giải thích hoặc nội dung khác ngoài JSON.\n"
-        f"Nội dung:\n{text}"
-    )
+    prompt = f"""
+    Bạn là hệ thống AI chuyên sinh câu hỏi trắc nghiệm.
+    Trước tiên hãy xác định ngôn ngữ của văn bản dưới đây. Sau đó phân tích và sinh ra **{num_questions} câu hỏi trắc nghiệm có 4 lựa chọn** sử dụng **chính ngôn ngữ của văn bản đó**, trong đó chỉ **một lựa chọn là đúng**.
+
+    ---
+
+    📘 **Ngữ cảnh gốc (KHÔNG tóm tắt, KHÔNG cắt ngắn):**
+    {text}
+
+    ---
+
+    **Hướng dẫn chi tiết:**
+    1. Xác định **loại tài liệu** (ví dụ: học thuật, kỹ thuật, pháp luật, giáo dục, mô tả dự án,...).  
+    2. Sinh câu hỏi phù hợp phong cách đó.  
+    3. Mỗi câu hỏi phải:
+        - Context không phải là toàn bộ đoạn văn, mà là phần liên quan trực tiếp đến câu hỏi.
+        - Phản ánh đúng thông tin trong context (không suy diễn).
+        - Có 1 đáp án đúng rõ ràng, 3 đáp án nhiễu cùng chủ đề.
+        - Không hỏi trùng ý hoặc trùng dữ kiện.
+    4. Distractors phải hợp lý — cùng phạm trù, không quá sai.
+    5. Nếu nội dung context chỉ đủ cho 1-2 câu hỏi, trả ít hơn — không bịa thêm.
+
+    ---
+
+    **Định dạng đầu ra JSON (duy nhất, không có văn bản nào khác):**
+    [
+    {{
+        "context": "Đoạn văn bản liên quan đến câu hỏi (giữ nguyên, không tóm tắt).",
+        "question": "Câu hỏi trắc nghiệm tiếng Việt rõ ràng, có một đáp án đúng duy nhất.",
+        "options": [
+            "A. Đáp án thứ nhất",
+            "B. Đáp án thứ hai",
+            "C. Đáp án thứ ba",
+            "D. Đáp án thứ tư"
+        ],
+        "answer_letter": "B"
+    }},
+    ...
+    ]
+
+    **Lưu ý bắt buộc:**
+    - KHÔNG chèn markdown hoặc ```json.  
+    - Nếu không thể tạo hợp lệ, trả về `[]`.  
+    - Giữ nguyên văn context, không được tóm tắt hay cắt ngắn.
+    """
 
     resp = model.generate_content([prompt])
     mcq_text = resp.text.strip()
@@ -162,150 +198,125 @@ def save_json_to_disk(obj, filename: str) -> str:
     return out_path
 
 
-# Evaluation weights and thresholds
-EVAL_WEIGHTS = {
-    "accuracy": 50,
-    "distractors": 20,
-    "alignment": 25,
-    "clarity": 5,
-}
+def get_hash_key(context, question):
+    # Ép toàn bộ phần tử về string, tránh lỗi tuple/bool/int
+    def to_str(x):
+        if isinstance(x, (list, tuple)):
+            return " ".join(str(i) for i in x)
+        return str(x)
 
-EVAL_THRESHOLDS = {
-    "pass": 80,
-    "need_review_min": 60,
-}
-
+    context_str = to_str(context)
+    question_str = to_str(question)
+    return hashlib.md5((context_str + question_str).encode("utf-8")).hexdigest()
 
 def evaluate_mcq(mcq: dict, context_text: str = "") -> dict:
-    """
-    Đánh giá một câu hỏi trắc nghiệm (MCQ) và trả về một dict có 'score' (0-100) và 'evaluation' (nhận xét).
-    Hàm này dùng các quy tắc heuristic đơn giản để chạy cục bộ (không gọi API):
-    - accuracy (độ chính xác): kiểm tra xem đáp án có nằm trong các lựa chọn hay là ký hiệu chữ cái (A/B/C/D)
-    - distractors (độ phân tán lựa chọn): kiểm tra các lựa chọn có trùng lặp hay tương đồng quá mức
-    - alignment (sự phù hợp): kiểm tra mức độ chồng token giữa context và question/options
-    - clarity (độ rõ ràng): kiểm tra độ dài câu hỏi và dấu câu (ví dụ dấu hỏi)
-    Ngưỡng và trọng số đã được định nghĩa bằng các hằng phía trên.
-    Nếu tổng điểm < 60 thì verdict = 'rejected' (vẫn giữ câu hỏi trong kết quả nhưng được gắn tag).
-    Trả về bản sao của mcq đã được mở rộng với các trường: 'score', 'evaluation', 'status', 'tags', '_eval_breakdown'.
-    """
-    # Defensive defaults
-    question = (mcq.get("question") or "").strip()
-    options = mcq.get("options") or []
-    answer = (mcq.get("answer") or "").strip()
-    context = (mcq.get("context") or context_text or "").strip()
+    global EVAL_CACHE
+    key = get_hash_key(context_text, mcq.get("question", ""))
+    if key in EVAL_CACHE:
+        return EVAL_CACHE[key]
 
-    # Phát hiện các trường hợp generator trả về placeholder lỗi hoặc dữ liệu không hợp lệ
-    invalid_generated = False
-    q_lower = question.lower()
-    opt_lowers = [o.lower().strip() for o in options]
-    # Nếu câu hỏi có chứa chuỗi báo lỗi hoặc tất cả lựa chọn giống nhau là 'lỗi', đánh dấu là invalid
-    if any(s in q_lower for s in ["không thể tạo câu hỏi hợp lệ", "không thể tạo", "lỗi"]):
-        invalid_generated = True
-    if opt_lowers and len(set(opt_lowers)) == 1 and list(set(opt_lowers))[0] in ["lỗi", "error", "err"]:
-        invalid_generated = True
+    question_data = [mcq]
 
-    # Accuracy (50): true answer must be one of the options; prefer letter labels
-    acc_score = 0
-    normalized_opts = [str(o).strip() for o in options]
-    # Extract letter from answer like 'A. X' or 'A'
-    ans_letter = None
-    if isinstance(answer, str) and answer:
-        if answer and len(answer) >= 1 and answer[0].upper() in "ABCD":
-            ans_letter = answer[0].upper()
-    # Map letters to options
-    letter_map = {}
-    for idx, opt in enumerate(normalized_opts):
-        letter = chr(ord('A') + idx)
-        letter_map[letter] = opt
+    prompt = f"""
+Bạn là chuyên gia có kinh nghiệm trong việc đánh giá chất lượng câu hỏi trắc nghiệm (MCQs).
 
-    if ans_letter and ans_letter in letter_map:
-        # check that the answer text is non-empty and not the same as others
-        ans_text = letter_map[ans_letter]
-        if ans_text and ans_text.lower() not in [o.lower() for o in normalized_opts if o != ans_text]:
-            acc_score = EVAL_WEIGHTS['accuracy']
-        else:
-            acc_score = int(EVAL_WEIGHTS['accuracy'] * 0.6)
-    else:
-        # if answer is full text, check membership
-        if answer and any(answer.lower() in o.lower() or o.lower() in answer.lower() for o in normalized_opts):
-            acc_score = int(EVAL_WEIGHTS['accuracy'] * 0.8)
-        else:
-            acc_score = 0
+Hãy chấm điểm từng câu hỏi theo 4 tiêu chí sau (tổng cộng 100 điểm):
 
-    # Distractors (20): penalize duplicates and extremely short/long options
-    dist_score = EVAL_WEIGHTS['distractors']
-    if len(normalized_opts) < 2:
-        dist_score = 0
-    else:
-        uniq = len(set([o.lower() for o in normalized_opts]))
-        dup_factor = uniq / max(1, len(normalized_opts))
-        # length diversity penalty
-        lengths = [len(o) for o in normalized_opts if o]
-        if lengths:
-            avg_len = sum(lengths) / len(lengths)
-            len_penalty = max(0, 1 - (sum(abs(l - avg_len) for l in lengths) / (len(lengths) * max(1, avg_len))))
-        else:
-            len_penalty = 0
-        dist_score = int(dist_score * dup_factor * len_penalty)
+1. **Accuracy (50 điểm)**  
+- Độ chính xác của đáp án đúng so với nội dung gốc.  
+- Đúng hoàn toàn → 50; Gần đúng → 30-45; Sai hoặc không có trong văn bản → 0-25.  
 
-    # Alignment (20): token overlap between context and question/options
-    align_score = 0
+2. **Alignment (25 điểm)**  
+- Mức độ bám sát trọng tâm nội dung.  
+- Đúng trọng tâm → 20; Chi tiết phụ hoặc suy luận thêm → 5-15; Không liên quan → 0.  
+
+3. **Distractors (20 điểm)**  
+- Độ hợp lý của đáp án sai.  
+- Hợp lý, cùng phạm trù → 18-20; Có 1-2 lựa chọn dễ loại → 10-17; Phần lớn vô lý → 0-9.  
+
+4. **Clarity (5 điểm)**  
+- Độ rõ ràng, ngữ pháp, mạch lạc.  
+- 5: Rõ ràng, đúng ngữ pháp; 4: Hơi dài dòng; 3: Có lỗi nhỏ; 2: Sai cấu trúc; 1-0: Mơ hồ hoặc vô nghĩa. 
+
+---
+
+**Yêu cầu kết quả:**  
+Chỉ trả về **một JSON hợp lệ duy nhất**, không có văn bản nào khác.
+
+Cấu trúc JSON:
+{{
+  "overall_score": <điểm trung bình>,
+  "details": [
+    {{
+      "question": "Câu hỏi",
+      "scores": {{
+        "accuracy": <0-50>,
+        "alignment": <0-25>,
+        "distractors": <0-20>,
+        "clarity": <0-5>,
+        "total": <tổng điểm>
+      }},
+      "status": "accepted | need_review | rejected"
+    }}
+  ]
+}}
+
+Quy tắc phân loại:
+- total ≥ 80 → accepted  
+- 60 ≤ total < 80 → need_review  
+- total < 60 → rejected  
+
+---
+
+**Context (nội dung gốc):**
+{context_text}
+
+**Danh sách câu hỏi:**
+{json.dumps(question_data, ensure_ascii=False, indent=2)}
+"""
+
     try:
-        ctx_tokens = set([t.lower() for t in context.split() if len(t) > 3])
-        q_tokens = set([t.lower() for t in question.split() if len(t) > 3])
-        opt_tokens = set()
-        for o in normalized_opts:
-            opt_tokens.update([t.lower() for t in o.split() if len(t) > 3])
-        overlap = len((q_tokens | opt_tokens) & ctx_tokens)
-        total = max(1, len(q_tokens | opt_tokens))
-        align_score = int(EVAL_WEIGHTS['alignment'] * (overlap / total))
-    except Exception:
-        align_score = 0
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        text = response.text.strip()
 
-    # Clarity (10): prefer question length between 20 and 150 chars and presence of question mark
-    clarity_score = 0
-    qlen = len(question)
-    if 20 <= qlen <= 200:
-        clarity_score = EVAL_WEIGHTS['clarity']
-    else:
-        # partial credit for short/long
-        clarity_score = int(EVAL_WEIGHTS['clarity'] * max(0.0, 1 - abs(qlen - 80) / 200))
-    if '?' in question:
-        clarity_score = min(EVAL_WEIGHTS['clarity'], clarity_score + 2)
+        # Làm sạch output để parse JSON
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
 
-    total_score = acc_score + dist_score + align_score + clarity_score
-    # clamp
-    total_score = max(0, min(100, int(total_score)))
+        data = json.loads(text)
+        details = data.get("details", [{}])[0]
+        scores = details.get("scores", {})
+        total = scores.get("total", data.get("overall_score", 0))
 
-    # Nếu phát hiện là placeholder/error do generator, ép score về 0 và verdict là 'rejected'
-    if invalid_generated:
-        total_score = 0
-        verdict = 'rejected'
-    else:
-        if total_score >= EVAL_THRESHOLDS['pass']:
-            verdict = 'pass'
-        elif total_score >= EVAL_THRESHOLDS['need_review_min']:
-            verdict = 'need review'
-        else:
-            verdict = 'rejected'
+        # Chuyển kết quả sang dạng giống cũ để tương thích hệ thống
+        mcq_result = dict(mcq)
+        mcq_result["score"] = int(total)
+        mcq_result["status"] = details.get("status", "need_review")
+        mcq_result["_eval_breakdown"] = {
+            "accuracy": scores.get("accuracy", 0),
+            "alignment": scores.get("alignment", 0),
+            "distractors": scores.get("distractors", 0),
+            "clarity": scores.get("clarity", 0),
+        }
 
-    # Gắn kết quả vào object câu hỏi (không xóa câu hỏi ngay cả khi rejected)
-    result = dict(mcq)
-    result['score'] = total_score
-    result['evaluation'] = verdict
-    # Trạng thái/tags rõ ràng để dễ lọc: ví dụ 'rejected', 'pass', 'need review'
-    result['status'] = verdict
-    # tags là danh sách để dễ mở rộng về sau
-    result['tags'] = [verdict]
-    if invalid_generated:
-        # tag thêm để dễ lọc các câu hỏi sinh ra là placeholder/error
-        result['tags'].append('invalid_generated')
-        result['_eval_notes'] = 'generator_returned_placeholder_or_error'
-    # Chi tiết điểm từng tiêu chí (dùng để debug hoặc hiển thị nội bộ)
-    result['_eval_breakdown'] = {
-        'accuracy': acc_score,
-        'distractors': dist_score,
-        'alignment': align_score,
-        'clarity': clarity_score,
-    }
-    return result
+        EVAL_CACHE[key] = mcq_result
+        return mcq_result
+
+    except Exception as e:
+        fallback = dict(mcq)
+        fallback["score"] = 0
+        fallback["status"] = "rejected"
+        fallback["_eval_breakdown"] = {
+            "accuracy": 0,
+            "alignment": 0,
+            "distractors": 0,
+            "clarity": 0,
+        }
+        fallback["comment"] = f"Lỗi khi gọi Gemini: {str(e)}"
+        return fallback
