@@ -5,3 +5,4 @@ pymupdf
 python-docx
 google-generativeai
 python-multipart
+google-genai
