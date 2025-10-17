@@ -1,5 +1,5 @@
 from enum import Enum
-from .tools import call_gemini_summarize, call_gemini_generate_mcqs
+from .tools import call_gemini_summarize, call_gemini_generate_mcqs,evaluate_mcq
 
 class SummaryMode(str, Enum):
     AUTO = "auto"
@@ -35,33 +35,37 @@ class Agent:
         if summary_mode == SummaryMode.FORCE:
             summary = call_gemini_summarize(text)
             mcqs = call_gemini_generate_mcqs(summary, num_questions)
+            evaluated = [evaluate_mcq(q, context_text=summary) for q in mcqs]
             return {
                 "mode": "summary+mcqs",
                 "summary": summary,
-                "questions": mcqs
+                "questions": evaluated
             }
 
         # Chế độ NONE — không bao giờ tóm tắt
         if summary_mode == SummaryMode.NONE:
             mcqs = call_gemini_generate_mcqs(text, num_questions)
+            evaluated = [evaluate_mcq(q, context_text=text) for q in mcqs]
             return {
                 "mode": "mcqs",
-                "questions": mcqs
+                "questions": evaluated
             }
 
         # Chế độ AUTO — tóm tắt nếu text quá dài
         if len(text) > 3000:
             summary = call_gemini_summarize(text)
             mcqs = call_gemini_generate_mcqs(summary, num_questions)
+            evaluated = [evaluate_mcq(q, context_text=summary) for q in mcqs]
             return {
                 "mode": "summary+mcqs",
                 "summary": summary,
-                "questions": mcqs
+                "questions": evaluated
             }
 
         # Mặc định: sinh câu hỏi trực tiếp
         mcqs = call_gemini_generate_mcqs(text, num_questions)
+        evaluated = [evaluate_mcq(q, context_text=text) for q in mcqs]
         return {
             "mode": "mcqs",
-            "questions": mcqs
+            "questions": evaluated
         }
