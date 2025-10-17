@@ -100,7 +100,7 @@ def call_gemini_generate_mcqs(text: str, num_questions: int = 5, model_name: str
     1. Xác định **loại tài liệu** (ví dụ: học thuật, kỹ thuật, pháp luật, giáo dục, mô tả dự án,...).  
     2. Sinh câu hỏi phù hợp phong cách đó.  
     3. Mỗi câu hỏi phải:
-        - Context không phải là toàn bộ đoạn văn, mà là phần liên quan trực tiếp đến câu hỏi.
+        - Context không phải là toàn bộ đoạn văn, mà là phần liên quan trực tiếp đến câu hỏi, dài 2-3 câu.
         - Phản ánh đúng thông tin trong context (không suy diễn).
         - Có 1 đáp án đúng rõ ràng, 3 đáp án nhiễu cùng chủ đề.
         - Không hỏi trùng ý hoặc trùng dữ kiện.
